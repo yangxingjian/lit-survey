@@ -1,0 +1,196 @@
+import numpy as np
+import trimesh
+from PIL import Image
+import matplotlib.pyplot as plt
+
+def barycentric_coords(P, A, B, C):
+    """
+    Calculate the barycentric coordinates of point P with respect to triangle ABC (vectorized implementation)
+    P, A, B, C are all arrays of shape (n,3), return u,v,w, satisfying u+v+w=1
+    """
+    v0 = B - A
+    v1 = C - A
+    v2 = P - A
+    d00 = np.sum(v0 * v0, axis=1)
+    d01 = np.sum(v0 * v1, axis=1)
+    d11 = np.sum(v1 * v1, axis=1)
+    d20 = np.sum(v2 * v0, axis=1)
+    d21 = np.sum(v2 * v1, axis=1)
+    denom = d00 * d11 - d01 * d01
+    # Avoid division by zero
+    denom[denom == 0] = 1e-8
+    v = (d11 * d20 - d01 * d21) / denom
+    w = (d00 * d21 - d01 * d20) / denom
+    u = 1.0 - v - w
+    return u, v, w
+
+def main():
+    # ========================
+    # Parameter settings
+    # ========================
+    ply_filename = "obj_000001.ply"      # Your PLY file path
+    texture_filename = "obj_000001.png"  # Path to the texture image with the same name
+    output_patch_filename = "texture_patch.png"  # Output texture patch file name
+    output_mask_filename = "texture_mask.png"    # Output mask file name
+
+    len_pixel = 128  # The number of pixels corresponding to s (i.e., s is divided into len_pixel pixels)
+    
+    # ========================
+    # 1. Load mesh and texture image
+    # ========================
+    mesh = trimesh.load(ply_filename, process=False)
+    print("Loaded mesh: number of vertices = {}, number of faces = {}".format(len(mesh.vertices), len(mesh.faces)))
+    texture_img = Image.open(texture_filename).convert('RGB')
+    texture_array = np.array(texture_img)
+    tex_height, tex_width = texture_array.shape[:2]
+    
+    # ========================
+    # 2. Calculate s and select sampling point P and normal
+    # ========================
+    # Here, the diagonal of the bounding box is used as the object size, and s is set to 1/10 of the size
+    bbox = mesh.bounds  # shape (2,3)
+    object_size = np.linalg.norm(bbox[1] - bbox[0])
+    s = object_size / 10.0
+    print("Object size = {:.4f}, s = {:.4f}".format(object_size, s))
+    
+    # Select the sampling point P: here, the vertex closest to the center of the bounding box is chosen
+    bbox_center = (bbox[0] + bbox[1]) / 2.0
+    dists = np.linalg.norm(mesh.vertices - bbox_center, axis=1)
+    sample_idx = np.argmin(dists)
+    P = mesh.vertices[sample_idx]
+    print("Sampling point P index = {}, coordinates = {}".format(sample_idx, P))
+
+    # Get the normal vector of the sampling point
+    if mesh.vertex_normals is not None and len(mesh.vertex_normals) > sample_idx:
+        normal = mesh.vertex_normals[sample_idx]
+    else:
+        # If there is no vertex normal, take the average of the normal vectors of the adjacent faces of the sampling point
+        face_mask = np.any(mesh.faces == sample_idx, axis=1)
+        adjacent_face_indices = np.where(face_mask)[0]
+        if len(adjacent_face_indices) > 0:
+            face_normals = mesh.face_normals[adjacent_face_indices]
+            normal = face_normals.mean(axis=0)
+            normal = normal / np.linalg.norm(normal)
+        else:
+            normal = np.array([0, 0, 1])
+    
+    # Construct the local tangent plane basis T1, T2 perpendicular to the normal
+    if abs(normal[2]) < 0.9:
+        ref = np.array([0, 0, 1])
+    else:
+        ref = np.array([0, 1, 0])
+    T1 = np.cross(normal, ref)
+    T1 = T1 / np.linalg.norm(T1)
+    T2 = np.cross(normal, T1)
+    T2 = T2 / np.linalg.norm(T2)
+    
+    # ========================
+    # 3. Move the sampling plane origin from P along the normal by object_size, and intersect along the -normal ray
+    # ========================
+    # Move the sampling plane origin from P along the normal by object_size
+    projection_origin = P + object_size * normal
+
+    # Create a square sampling area covering 2s x 2s (image size is 2*len_pixel x 2*len_pixel)
+    grid_size = 2 * len_pixel
+    xs = np.linspace(-s, s, grid_size)
+    ys = np.linspace(-s, s, grid_size)
+    grid_X, grid_Y = np.meshgrid(xs, ys)
+    grid_X_flat = grid_X.ravel()
+    grid_Y_flat = grid_Y.ravel()
+    num_points = grid_X_flat.shape[0]
+    
+    # Only select points within the radius s
+    distances_2d = np.sqrt(grid_X_flat**2 + grid_Y_flat**2)
+    valid_circle = distances_2d <= s
+    
+    # Calculate the 3D position of each sampling point: Q = projection_origin + x*T1 + y*T2
+    origins = projection_origin + np.outer(grid_X_flat, T1) + np.outer(grid_Y_flat, T2)
+    
+    # All ray directions are -normal
+    ray_direction = -normal
+    ray_directions = np.tile(ray_direction, (num_points, 1))
+    
+    # Emit rays only for sampling points in the valid region
+    valid_indices = np.where(valid_circle)[0]
+    valid_origins = origins[valid_indices]
+    valid_ray_directions = ray_directions[valid_indices]
+    
+    # Use intersects_location to get all intersection information
+    # locations: all intersection coordinates
+    # index_ray: which ray in valid_origins has an intersection
+    # index_tri: the face index corresponding to the intersection (these indices are valid in mesh.faces)
+    locations, index_ray, index_tri = mesh.ray.intersects_location(
+        ray_origins=valid_origins, 
+        ray_directions=valid_ray_directions,
+        multiple_hits=False
+    )
+    
+    # hit_points are the intersection coordinates
+    hit_points = locations
+    hit_face_indices = index_tri
+
+    # ========================
+    # 4. Calculate the UV coordinates of the intersection point using the intersection face vertices and their UV, and sample the texture color
+    # ========================
+    faces = mesh.faces[hit_face_indices]
+    A = mesh.vertices[faces[:, 0]]
+    B = mesh.vertices[faces[:, 1]]
+    C = mesh.vertices[faces[:, 2]]
+
+    # Calculate the barycentric coordinates of the intersection point (vectorized)
+    u, v, w = barycentric_coords(hit_points, A, B, C)
+
+    # Read the UV coordinates of each vertex (assuming stored in mesh.visual.uv)
+    if hasattr(mesh.visual, 'uv') and mesh.visual.uv is not None:
+        vertex_uv = mesh.visual.uv
+    else:
+        raise ValueError("Failed to read texture UV information!")
+
+    uvA = vertex_uv[faces[:, 0]]
+    uvB = vertex_uv[faces[:, 1]]
+    uvC = vertex_uv[faces[:, 2]]
+
+    # Calculate the UV coordinates of the intersection point using barycentric interpolation
+    hit_uv = u[:, None] * uvA + v[:, None] * uvB + w[:, None] * uvC
+
+    # ----------------------------
+    # Here, use vectorization to replace the for loop for texture sampling
+    x_tex = np.rint(hit_uv[:, 0] * (tex_width - 1)).astype(np.int32)
+    y_tex = np.rint((1 - hit_uv[:, 1]) * (tex_height - 1)).astype(np.int32)
+    x_tex = np.clip(x_tex, 0, tex_width - 1)
+    y_tex = np.clip(y_tex, 0, tex_height - 1)
+    hit_colors = texture_array[y_tex, x_tex]
+    # ----------------------------
+
+    # Fill the sampling color into the corresponding position
+    global_hit_indices = valid_indices[index_ray]
+    patch_color = np.zeros((num_points, 3), dtype=np.uint8)
+    patch_mask = np.zeros(num_points, dtype=np.uint8)
+    patch_color[global_hit_indices] = hit_colors
+    patch_mask[global_hit_indices] = 255
+    
+    # ========================
+    # 5. Generate and save the output image and mask
+    # ========================
+    patch_color_img = patch_color.reshape((grid_size, grid_size, 3))
+    patch_mask_img = patch_mask.reshape((grid_size, grid_size))
+    
+    Image.fromarray(patch_color_img).save(output_patch_filename)
+    Image.fromarray(patch_mask_img).save(output_mask_filename)
+    print("Texture patch saved to:", output_patch_filename)
+    print("Mask saved to:", output_mask_filename)
+    
+    plt.figure(figsize=(8, 4))
+    plt.subplot(1, 2, 1)
+    plt.imshow(patch_color_img)
+    plt.title("Texture Patch")
+    plt.axis('off')
+    
+    plt.subplot(1, 2, 2)
+    plt.imshow(patch_mask_img, cmap='gray')
+    plt.title("Mask")
+    plt.axis('off')
+    plt.show()
+
+if __name__ == '__main__':
+    main()
