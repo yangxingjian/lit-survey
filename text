@@ -2,6 +2,7 @@ import numpy as np
 import trimesh
 from PIL import Image
 import matplotlib.pyplot as plt
+import time
 
 def barycentric_coords(P, A, B, C):
     """
@@ -25,11 +26,13 @@ def barycentric_coords(P, A, B, C):
     return u, v, w
 
 def main():
+    section_times = {}
+    
     # ========================
     # Parameter settings
     # ========================
-    ply_filename = "obj_000001.ply"      # Your PLY file path
-    texture_filename = "obj_000001.png"  # Path to the texture image with the same name
+    ply_filename = "D:/Data/YCB_video/ycbv_models/models/obj_000001.ply"      # Your PLY file path
+    texture_filename = "D:/Data/YCB_video/ycbv_models/models/obj_000001.png"  # Path to the texture image with the same name
     output_patch_filename = "texture_patch.png"  # Output texture patch file name
     output_mask_filename = "texture_mask.png"    # Output mask file name
 
@@ -38,15 +41,18 @@ def main():
     # ========================
     # 1. Load mesh and texture image
     # ========================
+    t_start = time.time()
     mesh = trimesh.load(ply_filename, process=False)
     print("Loaded mesh: number of vertices = {}, number of faces = {}".format(len(mesh.vertices), len(mesh.faces)))
     texture_img = Image.open(texture_filename).convert('RGB')
     texture_array = np.array(texture_img)
     tex_height, tex_width = texture_array.shape[:2]
+    section_times['1. Load mesh and texture'] = time.time() - t_start
     
     # ========================
     # 2. Calculate s and select sampling point P and normal
     # ========================
+    t_start = time.time()
     # Here, the diagonal of the bounding box is used as the object size, and s is set to 1/10 of the size
     bbox = mesh.bounds  # shape (2,3)
     object_size = np.linalg.norm(bbox[1] - bbox[0])
@@ -83,10 +89,12 @@ def main():
     T1 = T1 / np.linalg.norm(T1)
     T2 = np.cross(normal, T1)
     T2 = T2 / np.linalg.norm(T2)
+    section_times['2. Calculate sampling point and normal'] = time.time() - t_start
     
     # ========================
     # 3. Move the sampling plane origin from P along the normal by object_size, and intersect along the -normal ray
     # ========================
+    t_start = time.time()
     # Move the sampling plane origin from P along the normal by object_size
     projection_origin = P + object_size * normal
 
@@ -128,10 +136,12 @@ def main():
     # hit_points are the intersection coordinates
     hit_points = locations
     hit_face_indices = index_tri
+    section_times['3. Ray intersection'] = time.time() - t_start
 
     # ========================
     # 4. Calculate the UV coordinates of the intersection point using the intersection face vertices and their UV, and sample the texture color
     # ========================
+    t_start = time.time()
     faces = mesh.faces[hit_face_indices]
     A = mesh.vertices[faces[:, 0]]
     B = mesh.vertices[faces[:, 1]]
@@ -168,10 +178,12 @@ def main():
     patch_mask = np.zeros(num_points, dtype=np.uint8)
     patch_color[global_hit_indices] = hit_colors
     patch_mask[global_hit_indices] = 255
+    section_times['4. UV calculation and texture sampling'] = time.time() - t_start
     
     # ========================
     # 5. Generate and save the output image and mask
     # ========================
+    t_start = time.time()
     patch_color_img = patch_color.reshape((grid_size, grid_size, 3))
     patch_mask_img = patch_mask.reshape((grid_size, grid_size))
     
@@ -191,6 +203,15 @@ def main():
     plt.title("Mask")
     plt.axis('off')
     plt.show()
+    section_times['5. Save and display results'] = time.time() - t_start
+
+    # Print timing results
+    print("\nTiming Results:")
+    print("-" * 40)
+    for section, elapsed_time in section_times.items():
+        print(f"{section}: {elapsed_time:.3f} seconds")
+    print("-" * 40)
+    print(f"Total time: {sum(section_times.values()):.3f} seconds")
 
 if __name__ == '__main__':
     main()
