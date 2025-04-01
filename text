@@ -1,5 +1,8 @@
 import numpy as np
 import trimesh
+from scipy.spatial import KDTree
+from trimesh import smoothing
+import pymeshfix
 import cv2
 from PIL import Image
 import matplotlib.pyplot as plt
@@ -29,13 +32,70 @@ def barycentric_coords(P, A, B, C):
     u = 1.0 - v - w
     return u, v, w
 
-def extract_texture_patch(ply_filename, texture_filename, len_pixel=128, smooth_method=None):
+def extract_texture_patch(ply_filename, texture_filename, len_pixel=128, smooth_method="laplacian", smooth_iterations=10):
 
     # Load mesh and texture image and preprocess
     mesh = trimesh.load(ply_filename, process=False)
-    
+    face_normals = mesh.face_normals
     texture_img = Image.open(texture_filename).convert('RGB')
     texture_array = np.array(texture_img)
+    
+    # if smooth, repair and smooth the mesh, then update the face normals
+    if smooth_method is not None:
+        meshfix = pymeshfix.MeshFix(mesh.vertices, mesh.faces)
+        meshfix.repair()
+        mesh_repaired = trimesh.Trimesh(vertices=meshfix.v, faces=meshfix.f)
+
+        if mesh_repaired.is_watertight:
+            print("PyMeshFix repair successful, the mesh is now closed.")
+        else:
+            print("The mesh still has problems after repair.")
+    
+        print(f"Applying {smooth_method} smoothing with {smooth_iterations} iterations...")
+        if smooth_method == "taubin": 
+            # Taubin smoothing, tend to keep sharper edges
+            mesh_smoothed = smoothing.filter_taubin(mesh_repaired, iterations=smooth_iterations) 
+        elif smooth_method == "laplacian": 
+            # Laplacian smoothing, tend to make the mesh smoother
+            mesh_smoothed = smoothing.filter_laplacian(mesh_repaired, iterations=smooth_iterations)
+        else:
+            print(f"Unknown smoothing method: {smooth_method}. Skipping smoothing.")
+            mesh_smoothed = mesh_repaired 
+            
+        # Establish the correspondence between the original mesh and the repaired mesh vertices
+        original_vertices = mesh.vertices
+        repaired_vertices = mesh_repaired.vertices
+
+        # Use KDTree for fast nearest neighbor search
+        tree = KDTree(repaired_vertices)
+        vertex_mapping = []
+        for v in original_vertices:
+            distance, idx = tree.query(v)
+            vertex_mapping.append(idx)
+        # vertex_mapping represents the index of the corresponding vertex in mesh_repaired/mesh_smoothed for the i-th vertex in mesh
+
+        # Recalculate the face normals based on the smoothed vertices
+        smoothed_vertices = mesh_smoothed.vertices
+        original_face_indices = mesh.faces.copy()
+        new_face_normals = []
+        for face in original_face_indices:
+            idx0 = vertex_mapping[face[0]]
+            idx1 = vertex_mapping[face[1]]
+            idx2 = vertex_mapping[face[2]]
+            v0 = smoothed_vertices[idx0]
+            v1 = smoothed_vertices[idx1]
+            v2 = smoothed_vertices[idx2]
+            
+            edge1 = v1 - v0
+            edge2 = v2 - v0
+            
+            normal = np.cross(edge1, edge2)
+            norm_val = np.linalg.norm(normal)
+            if norm_val > 1e-8:
+                normal = normal / norm_val
+            new_face_normals.append(normal)
+        new_face_normals = np.array(new_face_normals)
+        print("Updated face normals computed based on smoothed vertices.")
     
     # Calculate s and select a random surface sampling point P and its normal
     bbox = mesh.bounds  # shape (2,3)
@@ -45,13 +105,23 @@ def extract_texture_patch(ply_filename, texture_filename, len_pixel=128, smooth_
     idx = np.random.choice(len(sample_points))
     P = sample_points[idx]
     chosen_face_idx = face_indices[idx]
-    normal = mesh.face_normals[chosen_face_idx]
+    normal = face_normals[chosen_face_idx]
+    
+    list_patch_color_img = []
+    list_patch_mask_img = []
+    list_patch_mask_img_inpainted = []
     
     patch_color_img, patch_mask_img, patch_mask_img_inpainted = extract_texture_patch_at_point(normal, s, object_size, P, mesh, texture_array, len_pixel, plot=True)
     
     result = extract_vgg_features(patch_color_img, N=10, stats_type='sum')
     for key, value in result.items():
         print(f"{key}: {value}")
+        
+    list_patch_color_img.append(patch_color_img)
+    list_patch_mask_img.append(patch_mask_img)
+    list_patch_mask_img_inpainted.append(patch_mask_img_inpainted)
+    
+    return list_patch_color_img, list_patch_mask_img, list_patch_mask_img_inpainted
 
 def extract_texture_patch_at_point(normal, s, object_size, P, mesh, texture_array, len_pixel=128, plot=False):
     
@@ -236,4 +306,7 @@ if __name__ == '__main__':
     ply_filename = "D:/Data/YCB_video/ycbv_models/models/obj_000001.ply"      # Your PLY file path
     texture_filename = "D:/Data/YCB_video/ycbv_models/models/obj_000001.png"  # Path to the texture image with the same name
 
-    patch_color_img, patch_mask_img, patch_mask_img_inpainted = extract_texture_patch(ply_filename, texture_filename)
+    list_patch_color_img, list_patch_mask_img, list_patch_mask_img_inpainted = extract_texture_patch(ply_filename, texture_filename)
+    
+    
+
