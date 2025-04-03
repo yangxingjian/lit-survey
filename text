@@ -563,6 +563,18 @@ def extract_evened_vgg_features(img_array, N=10, stats_type='sum'):
     return activations_stats
 
 
+    # Register hooks to the first N convolution layers
+    conv_count = 0
+    for idx, layer in enumerate(model.features):
+        if isinstance(layer, torch.nn.Conv2d):
+            if conv_count < N:
+                layer.register_forward_hook(get_activation(f"conv_layer_{conv_count}"))
+                conv_count += 1
+            else:
+                break
+
+
+
 
 
 if __name__ == '__main__':
