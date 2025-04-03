@@ -481,6 +481,90 @@ def extract_vgg_features(img_array, N=10, stats_type='sum'):
 
     return activations_stats
 
+
+def extract_evened_vgg_features(img_array, N=10, stats_type='sum'):
+    """
+    Extracts the activation features of VGG16 after "mean balancing" processing, i.e., subtracts the mean of each convolution kernel in the model from itself,
+    and then calculates the statistical values of the first N layers.
+
+    Args:
+        img_array (np.ndarray): HxWx3 uint8 format image array
+        N (int): Number of layers to extract, default is 10
+        stats_type (str): Type of statistics, options are 'sum', 'mean', 'var', 'l1', 'l2', default is 'sum'
+
+    Returns:
+        activations_stats (dict): Statistical values of each layer's activation, the key is the layer name, and the value is the scalar value of the statistics.
+    """
+    # Check input
+    assert isinstance(img_array, np.ndarray) and img_array.ndim == 3 and img_array.shape[2] == 3, \
+        "The input image must be a HxWx3 uint8 numpy array."
+
+    # Convert numpy array to PIL image
+    img_pil = Image.fromarray(img_array.astype(np.uint8))
+
+    # Image preprocessing
+    preprocess = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225])
+    ])
+    # Preprocess and add batch dimension, shape: [1, 3, 224, 224]
+    img_tensor = preprocess(img_pil).unsqueeze(0)
+
+    # Load pre-trained VGG16 model and switch to evaluation mode
+    model = models.vgg16(pretrained=True)
+    model.eval()
+
+    # Iterate through all convolution layers in the model, performing "mean balancing" on each convolution kernel: subtracting its mean from each kernel
+    for layer in model.features:
+        if isinstance(layer, torch.nn.Conv2d):
+            # Weight shape: (out_channels, in_channels, kernel_height, kernel_width)
+            # Calculate the mean of each convolution kernel, keeping dimensions for easy subtraction
+            mean_per_filter = layer.weight.data.mean(dim=(1, 2, 3), keepdim=True)
+            layer.weight.data = layer.weight.data - mean_per_filter
+
+    # Dictionary to store activation values
+    activations = {}
+
+    # Define a hook function to capture layer activation values
+    def get_activation(name):
+        def hook(model, input, output):
+            activations[name] = output.detach()  # Do not backpropagate
+        return hook
+
+    # Register hooks to the first N layers (only registering hooks for the model.features part)
+    for idx, layer in enumerate(model.features):
+        if idx < N:
+            layer.register_forward_hook(get_activation(f"layer_{idx}"))
+
+    # Forward pass, automatically triggering hooks to capture activation values
+    _ = model(img_tensor)
+
+    # Calculate activation statistics based on the specified statistics type
+    activations_stats = {}
+    for key, activation in activations.items():
+        if stats_type == 'sum':
+            stat_value = activation.sum().item()
+        elif stats_type == 'mean':
+            stat_value = activation.mean().item()
+        elif stats_type == 'var':
+            stat_value = activation.var().item()
+        elif stats_type == 'l1':
+            stat_value = activation.abs().sum().item()
+        elif stats_type == 'l2':
+            stat_value = torch.norm(activation, p=2).item()
+        else:
+            raise ValueError("Unsupported statistics type, please choose one of 'sum', 'mean', 'var', 'l1', 'l2'.")
+
+        activations_stats[key] = stat_value
+
+    return activations_stats
+
+
+
+
 if __name__ == '__main__':
 
     ply_filename = "D:/Data/YCB_video/ycbv_models/models/obj_000005.ply"      # Your PLY file path
