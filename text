@@ -6,36 +6,36 @@ from scipy.interpolate import griddata
 # -------------------------
 # 1. Load mesh and texture
 # -------------------------
-mesh = trimesh.load('your_mesh.ply')  # Replace with your ply file path
+mesh = trimesh.load('your_mesh.ply')  # Replace with your PLY file path
 texture_img = cv2.imread('your_texture.png')
 tex_height, tex_width = texture_img.shape[:2]
 
-# Assuming point cloud and score arrays are given:
-# point_cloud: (N,3) numpy array
-# scores: (N,1) or (N,) numpy array
+# Assuming you have a point cloud (N,3) and score (N,1) arrays (note: score should be flattened to (N,))
 # For example:
-point_cloud = np.load('point_cloud.npy')
-scores = np.load('scores.npy')
-# (Ensure scores' shape is (N,) for convenient processing later)
+# point_cloud = np.load('point_cloud.npy')
+# scores = np.load('scores.npy')
 scores = scores.flatten()  # Ensure scores is a one-dimensional array
 
-# -------------------------------------------
-# 2. Calculate UV coordinates for each point on the mesh
-# -------------------------------------------
-# Use trimesh.proximity.closest_point to get the closest point and its face index on the mesh for each point
+# ----------------------------------------------------
+# 2. Calculate the UV coordinates of each point on the mesh
+# ----------------------------------------------------
+# Use trimesh.proximity.closest_point to ensure each point is precisely on the mesh surface
 closest_points, distances, face_indices = trimesh.proximity.closest_point(mesh, point_cloud)
+# If the point cloud itself has been accurately sampled from the mesh, closest_points should be very close to point_cloud,
+# but using closest_points to calculate is more robust
 
-# Get UV coordinates for each vertex on the mesh (ensure your mesh contains uv information)
-if (hasattr(mesh.visual, 'uv') and mesh.visual.uv is not None):
-    vertex_uv = mesh.visual.uv  # shape (n_vertices,2)
-else:
+# Check if the mesh has UV information
+if not (hasattr(mesh.visual, 'uv') and mesh.visual.uv is not None):
     raise ValueError("Mesh lacks UV information!")
+vertex_uv = mesh.visual.uv  # shape is (n_vertices, 2)
 
 def compute_barycentrics(P, A, B, C):
     """
     Calculate the barycentric weights of point P on triangle ABC.
-    P, A, B, C are all shape (3,) arrays.
-    Returns (u, v, w) satisfying u + v + w = 1.
+    Parameters:
+      P, A, B, C are all shape (3,) arrays
+    Returns:
+      (u, v, w) satisfying u + v + w = 1.
     """
     v0 = B - A
     v1 = C - A
@@ -46,64 +46,67 @@ def compute_barycentrics(P, A, B, C):
     d20 = np.dot(v2, v0)
     d21 = np.dot(v2, v1)
     denom = d00 * d11 - d01 * d01
-    # Do a small processing to prevent division by zero
     if np.abs(denom) < 1e-8:
-        return 1, 0, 0
+        return 1.0, 0.0, 0.0
     v = (d11 * d20 - d01 * d21) / denom
     w = (d00 * d21 - d01 * d20) / denom
     u = 1.0 - v - w
     return u, v, w
 
-# For each point, calculate barycentrics and UV coordinates based on its face
+# For each point, calculate barycentrics based on its face, then interpolate UV coordinates
 UV_points = []
-for i, (pt, face_idx) in enumerate(zip(point_cloud, face_indices)):
-    face = mesh.faces[face_idx]  # Three vertex indices
+for proj_pt, face_idx in zip(closest_points, face_indices):
+    # Get the indices of the three vertices of the face
+    face = mesh.faces[face_idx]
     A = mesh.vertices[face[0]]
     B = mesh.vertices[face[1]]
     C = mesh.vertices[face[2]]
-    u, v, w = compute_barycentrics(pt, A, B, C)
-    # Interpolate UV using barycentric weights
+    # Use the projected point to ensure it is within the triangle
+    u_val, v_val, w_val = compute_barycentrics(proj_pt, A, B, C)
+    # Take out the UV coordinates of the corresponding vertices
     uvA = vertex_uv[face[0]]
     uvB = vertex_uv[face[1]]
     uvC = vertex_uv[face[2]]
-    uv = u * uvA + v * uvB + w * uvC
+    # Interpolate to calculate the UV coordinates of this point
+    uv = u_val * uvA + v_val * uvB + w_val * uvC
     UV_points.append(uv)
-UV_points = np.array(UV_points)  # shape (N, 2)
+UV_points = np.array(UV_points)  # Get a (N,2) array
 
-# -----------------------------------------------------
-# 3. Use UV coordinates and scores for scattered interpolation to generate a new texture image
-# -----------------------------------------------------
+# ---------------------------------------------------------
+# 3. Use UV coordinates and score to generate a grayscale texture based on interpolation
+# ---------------------------------------------------------
 def generate_score_texture_interpolation(UV_points, scores, tex_width, tex_height, interp_method='linear'):
     """
     Parameters:
-      UV_points: (N, 2) array, normalized (u, v) coordinates [0,1]
+      UV_points: (N, 2) array, normalized UV coordinates [0,1]
       scores: (N, ) array, score values ranging [0,1]
-      tex_width, tex_height: Width and height of the new texture image
-      interp_method: Interpolation method, can be 'linear' or 'nearest'
+      tex_width, tex_height: width and height of the new texture image
+      interp_method: interpolation method, e.g., 'linear' or 'nearest'
     Returns:
-      Single-channel grayscale image (tex_height, tex_width), with values ranging from 0 to 255.
+      A single-channel grayscale image (tex_height, tex_width), with values ranging from 0 to 255.
     """
-    # Construct a UV grid with the same size as the texture image
+    # Construct a UV grid with the same resolution as the texture image
     grid_u, grid_v = np.meshgrid(np.linspace(0, 1, tex_width),
                                  np.linspace(0, 1, tex_height))
     grid_points = np.column_stack((grid_u.ravel(), grid_v.ravel()))
     
-    # Use scattered interpolation to spread score values across the entire UV grid
+    # Use scattered interpolation to get the score values for the entire grid
     grid_scores = griddata(UV_points, scores, grid_points, method=interp_method)
     grid_scores = grid_scores.reshape((tex_height, tex_width))
     
-    # For areas where interpolation fails, use nearest neighbor interpolation for supplementation
+    # For areas where interpolation fails (NaN), use nearest neighbor interpolation for filling
     if np.isnan(grid_scores).any():
         grid_scores_nn = griddata(UV_points, scores, grid_points, method='nearest')
+        grid_scores_nn = grid_scores_nn.reshape((tex_height, tex_width))  # Note: this must be reshaped
         grid_scores = np.where(np.isnan(grid_scores), grid_scores_nn, grid_scores)
     
-    # Map to 0-255 grayscale values
+    # Map to 0-255 grayscale and convert to uint8 type
     texture_img = (grid_scores * 255).astype(np.uint8)
     return texture_img
 
-# Call the function to generate the score texture image
+# Generate a grayscale texture based on score
 score_texture = generate_score_texture_interpolation(UV_points, scores, tex_width, tex_height)
 
-# Save the generated texture
+# Save the result
 cv2.imwrite("score_texture.png", score_texture)
 print("The generated score texture has been saved as score_texture.png")
