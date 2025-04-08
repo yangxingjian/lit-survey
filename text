@@ -1,42 +1,70 @@
 import numpy as np
 import cv2
 import trimesh
-from scipy.interpolate import griddata
 
-# -------------------------
-# 1. Load mesh and texture
-# -------------------------
-mesh = trimesh.load('your_mesh.ply')  # Replace with your PLY file path
-texture_img = cv2.imread('your_texture.png')
-tex_height, tex_width = texture_img.shape[:2]
+def generate_score_texture_splatting(UV_points, scores, tex_width, tex_height):
+    """
+    Generates a score texture using splatting based on UV_points and scores (both normalized to [0,1])
+    Parameters:
+      UV_points: (N, 2) array, representing the UV coordinates of points in the texture, range should be [0,1]
+      scores: (N,) array, score values range [0,1]
+      tex_width, tex_height: dimensions of the output texture image
+    Returns:
+      A single-channel uint8 grayscale image, value range 0-255
+    """
+    # Initialize accumulators to count the accumulated score values and contributing point counts for each pixel
+    score_accum = np.zeros((tex_height, tex_width), dtype=np.float32)
+    count_accum = np.zeros((tex_height, tex_width), dtype=np.float32)
+    
+    # Note: Forward code calculates pixel coordinates using
+    #    x_tex = rint(u * (tex_width - 1))
+    #    y_tex = rint((1 - v) * (tex_height - 1))
+    # Therefore, similar processing is needed for the v component of UV here
+    x_pixels = np.rint(UV_points[:, 0] * (tex_width - 1)).astype(np.int32)
+    y_pixels = np.rint((1 - UV_points[:, 1]) * (tex_height - 1)).astype(np.int32)
+    
+    # Accumulate the score values of each point at the corresponding pixel, and count the points
+    for x, y, s in zip(x_pixels, y_pixels, scores):
+        # Clip protection is done to handle potential UV mapping boundary issues
+        x = np.clip(x, 0, tex_width - 1)
+        y = np.clip(y, 0, tex_height - 1)
+        score_accum[y, x] += s
+        count_accum[y, x] += 1.0
 
-# Assuming you have a point cloud (N,3) and score (N,1) arrays (note: score should be flattened to (N,))
-# For example:
-# point_cloud = np.load('point_cloud.npy')
-# scores = np.load('scores.npy')
-scores = scores.flatten()  # Ensure scores is a one-dimensional array
+    # Calculate the average score for pixels with contributions; pixels without data are temporarily set to 0
+    texture = np.zeros_like(score_accum, dtype=np.float32)
+    nonzero_mask = count_accum > 0
+    texture[nonzero_mask] = score_accum[nonzero_mask] / count_accum[nonzero_mask]
+    
+    # Map to 0-255 and convert to uint8
+    texture_uint8 = (texture * 255).astype(np.uint8)
+    
+    # Construct a mask using inpaint to fill in areas without data (count==0)
+    mask = (count_accum == 0).astype(np.uint8) * 255
+    texture_inpaint = cv2.inpaint(texture_uint8, mask, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
+    
+    # Optionally: Use Gaussian blur to further smooth the result
+    texture_smooth = cv2.GaussianBlur(texture_inpaint, (3, 3), 0)
+    
+    return texture_smooth
 
-# ----------------------------------------------------
-# 2. Calculate the UV coordinates of each point on the mesh
-# ----------------------------------------------------
-# Use trimesh.proximity.closest_point to ensure each point is precisely on the mesh surface
+# Assuming the following are already available:
+# - mesh: mesh loaded with trimesh, containing UV information
+# - point_cloud: (N,3) point cloud, already sampled from the mesh or can be found on the corresponding face through projection
+# - scores: (N,) scores (e.g., using the normalized result of one color channel)
+# - tex_width, tex_height are the dimensions of the original texture image
+
+# ----------------------------------------
+# Calculate UV coordinates (ensuring consistency with forward extraction)
+# ----------------------------------------
+# This example uses trimesh.proximity.closest_point to get the closest point on the mesh for each point, along with the corresponding face index
 closest_points, distances, face_indices = trimesh.proximity.closest_point(mesh, point_cloud)
-# If the point cloud itself has been accurately sampled from the mesh, closest_points should be very close to point_cloud,
-# but using closest_points to calculate is more robust
 
-# Check if the mesh has UV information
 if not (hasattr(mesh.visual, 'uv') and mesh.visual.uv is not None):
     raise ValueError("Mesh lacks UV information!")
-vertex_uv = mesh.visual.uv  # shape is (n_vertices, 2)
+vertex_uv = mesh.visual.uv
 
 def compute_barycentrics(P, A, B, C):
-    """
-    Calculate the barycentric weights of point P on triangle ABC.
-    Parameters:
-      P, A, B, C are all shape (3,) arrays
-    Returns:
-      (u, v, w) satisfying u + v + w = 1.
-    """
     v0 = B - A
     v1 = C - A
     v2 = P - A
@@ -53,60 +81,23 @@ def compute_barycentrics(P, A, B, C):
     u = 1.0 - v - w
     return u, v, w
 
-# For each point, calculate barycentrics based on its face, then interpolate UV coordinates
 UV_points = []
 for proj_pt, face_idx in zip(closest_points, face_indices):
-    # Get the indices of the three vertices of the face
     face = mesh.faces[face_idx]
     A = mesh.vertices[face[0]]
     B = mesh.vertices[face[1]]
     C = mesh.vertices[face[2]]
-    # Use the projected point to ensure it is within the triangle
     u_val, v_val, w_val = compute_barycentrics(proj_pt, A, B, C)
-    # Take out the UV coordinates of the corresponding vertices
     uvA = vertex_uv[face[0]]
     uvB = vertex_uv[face[1]]
     uvC = vertex_uv[face[2]]
-    # Interpolate to calculate the UV coordinates of this point
     uv = u_val * uvA + v_val * uvB + w_val * uvC
     UV_points.append(uv)
-UV_points = np.array(UV_points)  # Get a (N,2) array
+UV_points = np.array(UV_points)
 
-# ---------------------------------------------------------
-# 3. Use UV coordinates and score to generate a grayscale texture based on interpolation
-# ---------------------------------------------------------
-def generate_score_texture_interpolation(UV_points, scores, tex_width, tex_height, interp_method='linear'):
-    """
-    Parameters:
-      UV_points: (N, 2) array, normalized UV coordinates [0,1]
-      scores: (N, ) array, score values ranging [0,1]
-      tex_width, tex_height: width and height of the new texture image
-      interp_method: interpolation method, e.g., 'linear' or 'nearest'
-    Returns:
-      A single-channel grayscale image (tex_height, tex_width), with values ranging from 0 to 255.
-    """
-    # Construct a UV grid with the same resolution as the texture image
-    grid_u, grid_v = np.meshgrid(np.linspace(0, 1, tex_width),
-                                 np.linspace(0, 1, tex_height))
-    grid_points = np.column_stack((grid_u.ravel(), grid_v.ravel()))
-    
-    # Use scattered interpolation to get the score values for the entire grid
-    grid_scores = griddata(UV_points, scores, grid_points, method=interp_method)
-    grid_scores = grid_scores.reshape((tex_height, tex_width))
-    
-    # For areas where interpolation fails (NaN), use nearest neighbor interpolation for filling
-    if np.isnan(grid_scores).any():
-        grid_scores_nn = griddata(UV_points, scores, grid_points, method='nearest')
-        grid_scores_nn = grid_scores_nn.reshape((tex_height, tex_width))  # Note: this must be reshaped
-        grid_scores = np.where(np.isnan(grid_scores), grid_scores_nn, grid_scores)
-    
-    # Map to 0-255 grayscale and convert to uint8 type
-    texture_img = (grid_scores * 255).astype(np.uint8)
-    return texture_img
-
-# Generate a grayscale texture based on score
-score_texture = generate_score_texture_interpolation(UV_points, scores, tex_width, tex_height)
+# Generate texture using the splatting method
+texture_from_score = generate_score_texture_splatting(UV_points, scores, tex_width, tex_height)
 
 # Save the result
-cv2.imwrite("score_texture.png", score_texture)
-print("The generated score texture has been saved as score_texture.png")
+cv2.imwrite("score_texture_splatting.png", texture_from_score)
+print("The generated score texture has been saved as score_texture_splatting.png")
