@@ -1,588 +1,109 @@
 import numpy as np
-import trimesh
-from scipy.spatial import KDTree
-from trimesh import smoothing
 import cv2
-import open3d as o3d
-from PIL import Image
-import matplotlib.pyplot as plt
-import torch
-import torch.nn as nn
-import torchvision.models as models
-import torchvision.transforms as transforms
+import trimesh
+from scipy.interpolate import griddata
 
-def barycentric_coords(P, A, B, C):
+# -------------------------
+# 1. Load mesh and texture
+# -------------------------
+mesh = trimesh.load('your_mesh.ply')  # Replace with your ply file path
+texture_img = cv2.imread('your_texture.png')
+tex_height, tex_width = texture_img.shape[:2]
+
+# Assuming point cloud and score arrays are given:
+# point_cloud: (N,3) numpy array
+# scores: (N,1) or (N,) numpy array
+# For example:
+point_cloud = np.load('point_cloud.npy')
+scores = np.load('scores.npy')
+# (Ensure scores' shape is (N,) for convenient processing later)
+scores = scores.flatten()  # Ensure scores is a one-dimensional array
+
+# -------------------------------------------
+# 2. Calculate UV coordinates for each point on the mesh
+# -------------------------------------------
+# Use trimesh.proximity.closest_point to get the closest point and its face index on the mesh for each point
+closest_points, distances, face_indices = trimesh.proximity.closest_point(mesh, point_cloud)
+
+# Get UV coordinates for each vertex on the mesh (ensure your mesh contains uv information)
+if (hasattr(mesh.visual, 'uv') and mesh.visual.uv is not None):
+    vertex_uv = mesh.visual.uv  # shape (n_vertices,2)
+else:
+    raise ValueError("Mesh lacks UV information!")
+
+def compute_barycentrics(P, A, B, C):
     """
-    Calculate the barycentric coordinates of point P with respect to triangle ABC (vectorized implementation)
-    P, A, B, C are all arrays of shape (n,3), return u,v,w, satisfying u+v+w=1
+    Calculate the barycentric weights of point P on triangle ABC.
+    P, A, B, C are all shape (3,) arrays.
+    Returns (u, v, w) satisfying u + v + w = 1.
     """
     v0 = B - A
     v1 = C - A
     v2 = P - A
-    d00 = np.sum(v0 * v0, axis=1)
-    d01 = np.sum(v0 * v1, axis=1)
-    d11 = np.sum(v1 * v1, axis=1)
-    d20 = np.sum(v2 * v0, axis=1)
-    d21 = np.sum(v2 * v1, axis=1)
+    d00 = np.dot(v0, v0)
+    d01 = np.dot(v0, v1)
+    d11 = np.dot(v1, v1)
+    d20 = np.dot(v2, v0)
+    d21 = np.dot(v2, v1)
     denom = d00 * d11 - d01 * d01
-    # Avoid division by zero
-    denom[denom == 0] = 1e-8
+    # Do a small processing to prevent division by zero
+    if np.abs(denom) < 1e-8:
+        return 1, 0, 0
     v = (d11 * d20 - d01 * d21) / denom
     w = (d00 * d21 - d01 * d20) / denom
     u = 1.0 - v - w
     return u, v, w
 
-def trimesh_to_open3d(tri_mesh):
-    o3d_mesh = o3d.geometry.TriangleMesh()
-    o3d_mesh.vertices = o3d.utility.Vector3dVector(tri_mesh.vertices)
-    o3d_mesh.triangles = o3d.utility.Vector3iVector(tri_mesh.faces)
-    o3d_mesh.compute_vertex_normals()
-    return o3d_mesh
-def extract_texture_patch(ply_filename, texture_filename, len_pixel=128, smooth_method="laplacian", smooth_iterations=5):
+# For each point, calculate barycentrics and UV coordinates based on its face
+UV_points = []
+for i, (pt, face_idx) in enumerate(zip(point_cloud, face_indices)):
+    face = mesh.faces[face_idx]  # Three vertex indices
+    A = mesh.vertices[face[0]]
+    B = mesh.vertices[face[1]]
+    C = mesh.vertices[face[2]]
+    u, v, w = compute_barycentrics(pt, A, B, C)
+    # Interpolate UV using barycentric weights
+    uvA = vertex_uv[face[0]]
+    uvB = vertex_uv[face[1]]
+    uvC = vertex_uv[face[2]]
+    uv = u * uvA + v * uvB + w * uvC
+    UV_points.append(uv)
+UV_points = np.array(UV_points)  # shape (N, 2)
 
-    # Load mesh and texture image and preprocess
-    mesh = trimesh.load(ply_filename, process=False)
-    face_normals = mesh.face_normals
-    texture_img = Image.open(texture_filename).convert('RGB')
-    texture_array = np.array(texture_img)
-    
-    # if smooth, repair and smooth the mesh, then update the face normals
-    flag_smooth = True
-    if smooth_method is not None:
-        # Convert the trimesh mesh to Open3D mesh
-        mesh_o3d = o3d.geometry.TriangleMesh()
-        mesh_o3d.vertices = o3d.utility.Vector3dVector(mesh.vertices)
-        mesh_o3d.triangles = o3d.utility.Vector3iVector(mesh.faces)
-        mesh_o3d.compute_vertex_normals()
-
-        # Use some built-in methods of Open3D to repair the mesh:
-        mesh_o3d.remove_degenerate_triangles()    
-        mesh_o3d.remove_duplicated_triangles()      
-        mesh_o3d.remove_duplicated_vertices()        
-        mesh_o3d.remove_non_manifold_edges()      
-        mesh_o3d.remove_unreferenced_vertices()      
-
-        # Convert the repaired Open3D mesh back to trimesh mesh
-        vertices = np.asarray(mesh_o3d.vertices)
-        faces = np.asarray(mesh_o3d.triangles)
-        mesh_repaired = trimesh.Trimesh(vertices=vertices, faces=faces)
-
-        if mesh_repaired.is_watertight:
-            print("Repair successful, the mesh is now closed.")
-        else:
-            print("The mesh still has problems after repair.")
-            flag_smooth = False
-            
-        if flag_smooth:
-            print(f"Applying {smooth_method} smoothing with {smooth_iterations} iterations...")
-            
-            if smooth_method == "taubin": 
-                # Taubin smoothing, tend to keep sharper edges
-                mesh_smooth = smoothing.filter_taubin(mesh_repaired, iterations=smooth_iterations) 
-            elif smooth_method == "laplacian": 
-                # Laplacian smoothing, tend to make the mesh smoother
-                mesh_smooth = smoothing.filter_laplacian(mesh_repaired, iterations=smooth_iterations)
-            else:
-                print(f"Unknown smoothing method: {smooth_method}. Skipping smoothing.")
-                mesh_smooth = mesh_repaired     
-                
-            # Establish the correspondence between the original mesh and the repaired mesh vertices
-            original_vertices = mesh.vertices
-            repaired_vertices = mesh_repaired.vertices
-
-            # Use KDTree for fast nearest neighbor search
-            # map corresponding vertex index in mesh_repaired/mesh_smooth for the i-th vertex in mesh
-            tree = KDTree(repaired_vertices)
-            vertex_mapping = []
-            for v in original_vertices:
-                distance, idx = tree.query(v)
-                vertex_mapping.append(idx)
-            
-            # Recalculate the face normals based on the smoothed vertices
-            smoothed_vertices = mesh_smooth.vertices
-            original_face_indices = mesh.faces.copy()
-            new_face_normals = []
-            for face in original_face_indices:
-                idx0 = vertex_mapping[face[0]]
-                idx1 = vertex_mapping[face[1]]
-                idx2 = vertex_mapping[face[2]]
-                v0 = smoothed_vertices[idx0]
-                v1 = smoothed_vertices[idx1]
-                v2 = smoothed_vertices[idx2]
-                
-                edge1 = v1 - v0
-                edge2 = v2 - v0
-                
-                normal = np.cross(edge1, edge2)
-                norm_val = np.linalg.norm(normal)
-                if norm_val > 1e-8:
-                    normal = normal / norm_val
-                new_face_normals.append(normal)
-            face_normals = np.array(new_face_normals)
-            print("Updated face normals computed based on smoothed vertices.")
-               
-    list_patch_color_img = []
-    list_patch_mask_img = []
-    list_patch_mask_img_inpainted = []
-    list_patch_depth_img = []
-    list_patch_depth_inpainted = []
-    list_patch_normal_img = []
-    list_patch_normal_inpainted = []
-    list_d_range = []
-    
-    # Calculate s and select a random surface sampling point P and its normal
-    bbox = mesh.bounds  # shape (2,3)
-    object_size = np.linalg.norm(bbox[1] - bbox[0])
-    s = object_size / 10.0
-    sample_points, face_indices = trimesh.sample.sample_surface(mesh, count=1000)
-    idx = np.random.choice(len(sample_points))
-    P = sample_points[idx]
-    chosen_face_idx = face_indices[idx]
-    normal = face_normals[chosen_face_idx]
-    
-    dict_patch = extract_texture_patch_at_point(normal, s, object_size, P, mesh, texture_array, mesh_smooth, len_pixel, plot=True)
-    
-    result = extract_vgg_features(dict_patch['patch_color_img'], N=10, stats_type='sum')
-    for key, value in result.items():
-        print(f"{key}: {value}")
-        
-    list_patch_color_img.append(dict_patch['patch_color_img'])
-    list_patch_mask_img.append(dict_patch['patch_mask_img'])
-    list_patch_mask_img_inpainted.append(dict_patch['patch_mask_img_inpainted'])
-    list_patch_depth_img.append(dict_patch['patch_depth_img'])
-    list_patch_depth_inpainted.append(dict_patch['patch_depth_inpainted'])
-    list_patch_normal_img.append(dict_patch['patch_normal_img'])
-    list_patch_normal_inpainted.append(dict_patch['patch_normal_inpainted'])
-    list_d_range.append(dict_patch['d_range'])
-
-    return {
-        'patch_color_img': list_patch_color_img,
-        'patch_mask_img': list_patch_mask_img,
-        'patch_mask_img_inpainted': list_patch_mask_img_inpainted,
-        'patch_depth_img': list_patch_depth_img,
-        'patch_depth_inpainted': list_patch_depth_inpainted,
-        'patch_normal_img': list_patch_normal_img,
-        'patch_normal_inpainted': list_patch_normal_inpainted,
-        'd_range': list_d_range
-    }
-
-
-def extract_texture_patch_at_point(normal, s, object_size, P, mesh, texture_array, mesh_smooth, len_pixel=128, plot=False):
-
-    # Construct the basis T1, T2 of the local plane (sampling plane)
-    if abs(normal[2]) < 0.9:
-        ref = np.array([0, 0, 1])
-    else:
-        ref = np.array([0, 1, 0])
-    T1 = np.cross(normal, ref)
-    T1 = T1 / np.linalg.norm(T1)
-    T2 = np.cross(normal, T1)
-    T2 = T2 / np.linalg.norm(T2)
-    
-    # Construct the sampling grid, covering area is [-s, s] x [-s, s]
-    grid_size = 2 * len_pixel
-    xs = np.linspace(-s, s, grid_size)
-    ys = np.linspace(-s, s, grid_size)
-    grid_X, grid_Y = np.meshgrid(xs, ys)
-    grid_X_flat = grid_X.ravel()
-    grid_Y_flat = grid_Y.ravel()
-    num_points = grid_X_flat.shape[0]
-    
-    # Only keep the points within the range of s from the center (circular area)
-    distances_2d = np.sqrt(grid_X_flat**2 + grid_Y_flat**2)
-    valid_circle = distances_2d <= s
-    
-    # Define the sampling plane
-    projection_origin = P + object_size * normal
-    origins = projection_origin + np.outer(grid_X_flat, T1) + np.outer(grid_Y_flat, T2)
-    ray_direction = -normal
-    ray_directions = np.tile(ray_direction, (num_points, 1))
-    
-    # Only emit rays for sampling points in the valid area
-    valid_indices = np.where(valid_circle)[0]
-    valid_origins = origins[valid_indices]
-    valid_ray_directions = ray_directions[valid_indices]
-    
-    # compute patch based on texture ============================================================
-    locations, index_ray, index_tri = mesh.ray.intersects_location(
-        ray_origins=valid_origins, 
-        ray_directions=valid_ray_directions,
-        multiple_hits=False
-    )
-    hit_points = locations
-    hit_face_indices = index_tri
-
-    # Calculate the barycentric coordinates of the intersection points (Note: you need to define the barycentric_coords function yourself)
-    faces = mesh.faces[hit_face_indices]
-    A = mesh.vertices[faces[:, 0]]
-    B = mesh.vertices[faces[:, 1]]
-    C = mesh.vertices[faces[:, 2]]
-    u, v, w = barycentric_coords(hit_points, A, B, C)
-    
-    if hasattr(mesh.visual, 'uv') and mesh.visual.uv is not None:
-        vertex_uv = mesh.visual.uv
-    else:
-        raise ValueError("Failed to read texture UV information!")
-    
-    uvA = vertex_uv[faces[:, 0]]
-    uvB = vertex_uv[faces[:, 1]]
-    uvC = vertex_uv[faces[:, 2]]
-    hit_uv = u[:, None] * uvA + v[:, None] * uvB + w[:, None] * uvC
-    
-    # Sample the texture color based on UV coordinates
-    tex_height, tex_width = texture_array.shape[:2]
-    x_tex = np.rint(hit_uv[:, 0] * (tex_width - 1)).astype(np.int32)
-    y_tex = np.rint((1 - hit_uv[:, 1]) * (tex_height - 1)).astype(np.int32)
-    x_tex = np.clip(x_tex, 0, tex_width - 1)
-    y_tex = np.clip(y_tex, 0, tex_height - 1)
-    hit_colors = texture_array[y_tex, x_tex]
-    
-    # Fill the sampling results into the entire patch
-    global_hit_indices = valid_indices[index_ray]
-    patch_color = np.zeros((num_points, 3), dtype=np.uint8)
-    patch_mask = np.zeros(num_points, dtype=np.uint8)
-    patch_color[global_hit_indices] = hit_colors
-    patch_mask[global_hit_indices] = 255
-    patch_color_img = patch_color.reshape((grid_size, grid_size, 3))
-    patch_mask_img = patch_mask.reshape((grid_size, grid_size))
-    patch_mask_img_inpainted = cv2.inpaint(patch_color_img, (255 - patch_mask_img), inpaintRadius=1, flags=cv2.INPAINT_TELEA)
-    
-
-    # compute patch based on geometry ============================================================
-    locations_geo, index_ray_geo, index_tri_geo = mesh_smooth.ray.intersects_location(
-        ray_origins=valid_origins, 
-        ray_directions=valid_ray_directions,
-        multiple_hits=False
-    )
-    
-    # Calculate the barycentric coordinates of the intersection points for geometry information
-    faces_geo = mesh_smooth.faces[index_tri_geo]
-    A_geo = mesh_smooth.vertices[faces_geo[:, 0]]
-    B_geo = mesh_smooth.vertices[faces_geo[:, 1]]
-    C_geo = mesh_smooth.vertices[faces_geo[:, 2]]
-    u_geo, v_geo, w_geo = barycentric_coords(locations_geo, A_geo, B_geo, C_geo)
-    
-    # Calculate the depth: the distance from the sampling plane to the intersection point along the projection of normal (projection_origin is on the sampling plane)
-    depths = np.dot((projection_origin - locations_geo), normal)
-    
-    # Calculate the normal vector: use the vertex normal vector of mesh_smooth for barycentric interpolation
-    if hasattr(mesh_smooth, 'vertex_normals') and mesh_smooth.vertex_normals is not None:
-        vertex_normals = mesh_smooth.vertex_normals
-    else:
-        raise ValueError("Failed to read mesh_smooth vertex normals!")
-    normals_A = vertex_normals[faces_geo[:, 0]]
-    normals_B = vertex_normals[faces_geo[:, 1]]
-    normals_C = vertex_normals[faces_geo[:, 2]]
-    hit_normals = u_geo[:, None] * normals_A + v_geo[:, None] * normals_B + w_geo[:, None] * normals_C
-    # Ensure that the normal vector is normalized, map [-1, 1] -> [0, 1]
-    hit_normals = hit_normals / (np.linalg.norm(hit_normals, axis=1, keepdims=True) + 1e-8)
-    hit_normals = (hit_normals + 1) / 2.0
-    
-    # Construct the geometry patch array
-    global_hit_indices_geo = valid_indices[index_ray_geo]
-    patch_depth = np.zeros(num_points, dtype=np.float32)
-    patch_normal = np.zeros((num_points, 3), dtype=np.float32)
-    patch_mask_geo = np.zeros(num_points, dtype=np.uint8)
-    patch_depth[global_hit_indices_geo] = depths
-    patch_normal[global_hit_indices_geo] = hit_normals * 255.0  # Map to 0-255
-    patch_mask_geo[global_hit_indices_geo] = 255
-    patch_depth_img = patch_depth.reshape((grid_size, grid_size))
-    patch_normal_img = patch_normal.reshape((grid_size, grid_size, 3)).astype(np.uint8)
-    patch_mask_geo_img = patch_mask_geo.reshape((grid_size, grid_size))
-    
-    # Normalize the depth image: only calculate d_min and d_max for the valid area
-    if np.any(patch_mask_geo_img == 255):
-        valid_depth = patch_depth_img[patch_mask_geo_img == 255]
-        d_min = valid_depth.min()
-        d_max = valid_depth.max()
-        d_range = d_max - d_min if d_max > d_min else 1.0
-        patch_depth_normalized = np.zeros_like(patch_depth_img, dtype=np.uint8)
-        # Normalize the valid pixels and map to 0-255
-        patch_depth_normalized[patch_mask_geo_img == 255] = np.rint(
-            ((patch_depth_img[patch_mask_geo_img == 255] - d_min) / d_range) * 255
-        ).astype(np.uint8)
-    else:
-        patch_depth_normalized = patch_depth_img.astype(np.uint8)
-        d_range = 0.0
-    
-    # Inpaint repair for geometry patch
-    patch_depth_inpainted = cv2.inpaint(patch_depth_normalized, (255 - patch_mask_geo_img), inpaintRadius=1, flags=cv2.INPAINT_TELEA)
-    patch_normal_inpainted = cv2.inpaint(patch_normal_img, (255 - patch_mask_geo_img), inpaintRadius=1, flags=cv2.INPAINT_TELEA)
-    
-    # mesh visualization
-    if plot:
-        mesh_o3d = trimesh_to_open3d(mesh)
-        mesh_smooth_o3d = trimesh_to_open3d(mesh_smooth)
-
-        # Create a blue sphere to represent point P, with a radius of s/5
-        sphere = o3d.geometry.TriangleMesh.create_sphere(radius=s/10)
-        sphere.paint_uniform_color([1, 0.5, 0])
-        sphere.translate(P)
-
-        # Construct the four corners of the sampling plane (square side length is 2*s)
-        corners = []
-        for dx, dy in [(s, s), (s, -s), (-s, -s), (-s, s)]:
-            corner = projection_origin + dx * T1 + dy * T2
-            corners.append(corner)
-        corners = np.array(corners)
-        # Construct LineSet to represent the boundary of the sampling plane, with the color red
-        lines = [[0, 1], [1, 2], [2, 3], [3, 0]]
-        plane_lines = o3d.geometry.LineSet()
-        plane_lines.points = o3d.utility.Vector3dVector(corners)
-        plane_lines.lines = o3d.utility.Vector2iVector(lines)
-        plane_lines.colors = o3d.utility.Vector3dVector([[0, 0, 0] for _ in range(len(lines))])
-        
-        # Create an arrow: from the center of the sampling plane (projection_origin) to P,
-        # The length of the arrow is fixed at s*2/3, and the direction is still based on P - projection_origin
-        arrow_vec = P - projection_origin
-        norm_arrow_dir = np.linalg.norm(arrow_vec)
-        if norm_arrow_dir < 1e-6:
-            norm_arrow_dir = 1e-6
-        arrow_dir = arrow_vec / norm_arrow_dir
-        arrow_length = object_size * 2.0 / 3.0
-        arrow = o3d.geometry.TriangleMesh.create_arrow(cylinder_radius=s/30, cone_radius=s/30*2, 
-                                                         cylinder_height=arrow_length * 0.8, cone_height=arrow_length * 0.2)
-        default_dir = np.array([0, 0, 1])
-        axis = np.cross(default_dir, arrow_dir)
-        if np.linalg.norm(axis) < 1e-6:
-            R = np.eye(3)
-        else:
-            axis = axis / np.linalg.norm(axis)
-            angle = np.arccos(np.clip(np.dot(default_dir, arrow_dir), -1, 1))
-            R = o3d.geometry.get_rotation_matrix_from_axis_angle(axis * angle)
-        arrow.rotate(R, center=np.array([0, 0, 0]))
-        arrow.translate(projection_origin)
-        arrow.paint_uniform_color([0.2, 0.4, 1])
-        
-        # Combine the various geometries for visualization: display mesh and mesh_smooth separately
-        vis_geometries = [mesh_o3d, sphere, plane_lines, arrow]
-        vis_geometries_smooth = [mesh_smooth_o3d, sphere, plane_lines, arrow]
-        o3d.visualization.draw_geometries(vis_geometries, window_name="Mesh Visualization")
-        o3d.visualization.draw_geometries(vis_geometries_smooth, window_name="Mesh Smooth Visualization")
-    
-    # patch visualization
-    if plot:
-        plt.figure(figsize=(12, 8))
-        
-        plt.subplot(2, 3, 1)
-        plt.imshow(patch_color_img)
-        plt.title("Texture Patch")
-        plt.axis('off')
-        
-        plt.subplot(2, 3, 2)
-        plt.imshow(patch_mask_img, cmap='gray')
-        plt.title("Texture Mask")
-        plt.axis('off')
-        
-        plt.subplot(2, 3, 3)
-        plt.imshow(patch_mask_img_inpainted)
-        plt.title("Texture Inpainted")
-        plt.axis('off')
-        
-        plt.subplot(2, 3, 4)
-        plt.imshow(patch_depth_normalized, cmap='gray')
-        plt.title("Depth Patch (Normalized)")
-        plt.axis('off')
-        
-        plt.subplot(2, 3, 5)
-        plt.imshow(patch_normal_img)
-        plt.title("Normal Patch")
-        plt.axis('off')
-        
-        plt.subplot(2, 3, 6)
-        plt.imshow(patch_normal_inpainted)
-        plt.title("Normal Patch Inpainted")
-        plt.axis('off')
-        
-        plt.tight_layout()
-        plt.show()
-        
-
-    return {
-        "patch_color_img": patch_color_img,
-        "patch_mask_img": patch_mask_img,
-        "patch_mask_img_inpainted": patch_mask_img_inpainted,
-        "patch_depth_img": patch_depth_normalized,
-        "patch_mask_geo": patch_mask_geo_img,
-        "patch_depth_inpainted": patch_depth_inpainted,
-        "patch_normal_img": patch_normal_img,
-        "patch_normal_inpainted": patch_normal_inpainted,
-        "d_range": d_range
-    }
-
-def extract_vgg_features(img_array, N=10, stats_type='sum'):
+# -----------------------------------------------------
+# 3. Use UV coordinates and scores for scattered interpolation to generate a new texture image
+# -----------------------------------------------------
+def generate_score_texture_interpolation(UV_points, scores, tex_width, tex_height, interp_method='linear'):
     """
-    Extract the activation features of the first N layers of VGG16 and calculate the specified statistics.
-    
-    Args:
-    - img_array (np.ndarray): HxWx3 uint8 image array
-    - N (int): Number of layers to capture (default is 10)
-    - stats_type (str): Type of statistics, options are 'sum', 'mean', 'var', 'l1', 'l2', default is 'sum'
-
+    Parameters:
+      UV_points: (N, 2) array, normalized (u, v) coordinates [0,1]
+      scores: (N, ) array, score values ranging [0,1]
+      tex_width, tex_height: Width and height of the new texture image
+      interp_method: Interpolation method, can be 'linear' or 'nearest'
     Returns:
-    - activations_stats (dict): Statistics of each layer, the key is the layer name, and the value is the scalar value of the statistics.
+      Single-channel grayscale image (tex_height, tex_width), with values ranging from 0 to 255.
     """
-    assert isinstance(img_array, np.ndarray) and img_array.ndim == 3 and img_array.shape[2] == 3, \
-        "The input image must be a HxWx3 uint8 numpy array."
-
-    # Convert numpy array to PIL image
-    img_pil = Image.fromarray(img_array.astype(np.uint8))
-
-    # Image preprocessing
-    preprocess = transforms.Compose([
-        transforms.Resize(256),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225])
-    ])
-
-    # Preprocess and add batch dimension
-    img_tensor = preprocess(img_pil).unsqueeze(0)  # Shape: [1, 3, 224, 224]
-
-    # Load pre-trained VGG16 model
-    model = models.vgg16(pretrained=True)
-    model.eval()  # Switch to evaluation mode
-
-    # Dictionary to store activation values
-    activations = {}
-
-    # Define a hook function to capture layer activation values
-    def get_activation(name):
-        def hook(model, input, output):
-            activations[name] = output.detach()  # Do not backpropagate
-        return hook
-
-    # Register hooks to the first N layers
-    for idx, layer in enumerate(model.features):
-        if idx < N:
-            layer.register_forward_hook(get_activation(f"layer_{idx}"))
-
-    # Forward pass, automatically trigger hooks to capture activation values
-    _ = model(img_tensor)
-
-    # Calculate activation statistics
-    activations_stats = {}
-    for key, activation in activations.items():
-        if stats_type == 'sum':
-            stat_value = activation.sum().item()
-        elif stats_type == 'mean':
-            stat_value = activation.mean().item()
-        elif stats_type == 'var':
-            stat_value = activation.var().item()
-        elif stats_type == 'l1':
-            stat_value = activation.abs().sum().item()
-        elif stats_type == 'l2':
-            stat_value = torch.norm(activation, p=2).item()
-        else:
-            raise ValueError("Unsupported statistics type, please choose one of 'sum', 'mean', 'var', 'l1', 'l2'.")
-
-        activations_stats[key] = stat_value
-
-    return activations_stats
-
-
-def extract_evened_vgg_features(img_array, N=10, stats_type='sum'):
-    """
-    Extracts the activation features of VGG16 after "mean balancing" processing, i.e., subtracts the mean of each convolution kernel in the model from itself,
-    and then calculates the statistical values of the first N layers.
-
-    Args:
-        img_array (np.ndarray): HxWx3 uint8 format image array
-        N (int): Number of layers to extract, default is 10
-        stats_type (str): Type of statistics, options are 'sum', 'mean', 'var', 'l1', 'l2', default is 'sum'
-
-    Returns:
-        activations_stats (dict): Statistical values of each layer's activation, the key is the layer name, and the value is the scalar value of the statistics.
-    """
-    # Check input
-    assert isinstance(img_array, np.ndarray) and img_array.ndim == 3 and img_array.shape[2] == 3, \
-        "The input image must be a HxWx3 uint8 numpy array."
-
-    # Convert numpy array to PIL image
-    img_pil = Image.fromarray(img_array.astype(np.uint8))
-
-    # Image preprocessing
-    preprocess = transforms.Compose([
-        transforms.Resize(256),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225])
-    ])
-    # Preprocess and add batch dimension, shape: [1, 3, 224, 224]
-    img_tensor = preprocess(img_pil).unsqueeze(0)
-
-    # Load pre-trained VGG16 model and switch to evaluation mode
-    model = models.vgg16(pretrained=True)
-    model.eval()
-
-    # Iterate through all convolution layers in the model, performing "mean balancing" on each convolution kernel: subtracting its mean from each kernel
-    for layer in model.features:
-        if isinstance(layer, torch.nn.Conv2d):
-            # Weight shape: (out_channels, in_channels, kernel_height, kernel_width)
-            # Calculate the mean of each convolution kernel, keeping dimensions for easy subtraction
-            mean_per_filter = layer.weight.data.mean(dim=(1, 2, 3), keepdim=True)
-            layer.weight.data = layer.weight.data - mean_per_filter
-
-    # Dictionary to store activation values
-    activations = {}
-
-    # Define a hook function to capture layer activation values
-    def get_activation(name):
-        def hook(model, input, output):
-            activations[name] = output.detach()  # Do not backpropagate
-        return hook
-
-    # Register hooks to the first N layers (only registering hooks for the model.features part)
-    for idx, layer in enumerate(model.features):
-        if idx < N:
-            layer.register_forward_hook(get_activation(f"layer_{idx}"))
-
-    # Forward pass, automatically triggering hooks to capture activation values
-    _ = model(img_tensor)
-
-    # Calculate activation statistics based on the specified statistics type
-    activations_stats = {}
-    for key, activation in activations.items():
-        if stats_type == 'sum':
-            stat_value = activation.sum().item()
-        elif stats_type == 'mean':
-            stat_value = activation.mean().item()
-        elif stats_type == 'var':
-            stat_value = activation.var().item()
-        elif stats_type == 'l1':
-            stat_value = activation.abs().sum().item()
-        elif stats_type == 'l2':
-            stat_value = torch.norm(activation, p=2).item()
-        else:
-            raise ValueError("Unsupported statistics type, please choose one of 'sum', 'mean', 'var', 'l1', 'l2'.")
-
-        activations_stats[key] = stat_value
-
-    return activations_stats
-
-
-    # Register hooks to the first N convolution layers
-    conv_count = 0
-    for idx, layer in enumerate(model.features):
-        if isinstance(layer, torch.nn.Conv2d):
-            if conv_count < N:
-                layer.register_forward_hook(get_activation(f"conv_layer_{conv_count}"))
-                conv_count += 1
-            else:
-                break
-
-
-
-
-
-if __name__ == '__main__':
-
-    ply_filename = "D:/Data/YCB_video/ycbv_models/models/obj_000005.ply"      # Your PLY file path
-    texture_filename = "D:/Data/YCB_video/ycbv_models/models/obj_000005.png"  # Path to the texture image with the same name
-
-    dict_patch = extract_texture_patch(ply_filename, texture_filename)
+    # Construct a UV grid with the same size as the texture image
+    grid_u, grid_v = np.meshgrid(np.linspace(0, 1, tex_width),
+                                 np.linspace(0, 1, tex_height))
+    grid_points = np.column_stack((grid_u.ravel(), grid_v.ravel()))
     
+    # Use scattered interpolation to spread score values across the entire UV grid
+    grid_scores = griddata(UV_points, scores, grid_points, method=interp_method)
+    grid_scores = grid_scores.reshape((tex_height, tex_width))
     
+    # For areas where interpolation fails, use nearest neighbor interpolation for supplementation
+    if np.isnan(grid_scores).any():
+        grid_scores_nn = griddata(UV_points, scores, grid_points, method='nearest')
+        grid_scores = np.where(np.isnan(grid_scores), grid_scores_nn, grid_scores)
+    
+    # Map to 0-255 grayscale values
+    texture_img = (grid_scores * 255).astype(np.uint8)
+    return texture_img
 
+# Call the function to generate the score texture image
+score_texture = generate_score_texture_interpolation(UV_points, scores, tex_width, tex_height)
+
+# Save the generated texture
+cv2.imwrite("score_texture.png", score_texture)
+print("The generated score texture has been saved as score_texture.png")
